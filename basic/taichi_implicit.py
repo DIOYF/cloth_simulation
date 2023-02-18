@@ -1,0 +1,159 @@
+import taichi as ti
+
+ti.init(arch=ti.cuda)
+
+# ==============create cloth mesh info ==============
+n = 128 # particle number in col and row
+Pos = ti.Vector.field(3, dtype=float, shape=(n, n))
+Vel = ti.Vector.field(3, dtype=float, shape=(n, n))
+Triangles = ti.field(int, shape = (n-1)*(n-1)*6)  # edge info about spring
+colors = ti.Vector.field(3, dtype=float, shape=n * n)
+vertices = ti.Vector.field(3, dtype=float, shape=n * n)
+
+#initial_edge and indices info. For convenience, spring original lenght is quad_size or quad_size * 1.414
+quad_size = 1/n
+
+@ti.kernel
+def initial_spring_mesh():
+    # initial each particle's position and velocity
+    random_offset = ti.Vector([ti.random() - 0.5, ti.random() - 0.5]) * 0.01
+    for i, j in Pos:
+        Pos[i, j] = [i * quad_size - 0.5 + random_offset[0], 0.6, j * quad_size - 0.5 + random_offset[1]]
+        Vel[i, j] = [0, 0, 0]
+
+    # initial triangle mesh indices and its velocity
+    for i, j in ti.ndrange(n-1, n-1):
+        indice_id = i * (n-1) + j
+        Triangles[indice_id * 6 + 0] = i * n + j
+        Triangles[indice_id * 6 + 1] = (i+1) * n + j
+        Triangles[indice_id * 6 + 2] = i * n + (j+1)
+        Triangles[indice_id * 6 + 3] = (i+1) * n + j + 1
+        Triangles[indice_id * 6 + 4] = i * n + (j + 1)
+        Triangles[indice_id * 6 + 5] = (i + 1) * n + j
+
+    # UV mapping , just initial color of corresponding vertices
+    for i, j in ti.ndrange(n, n):
+        if (i // 2 + j // 2) % 2 == 0:
+            colors[i * n + j] = (192 / 255, 208 / 255, 157 / 255)
+        else:
+            colors[i * n + j] = (245 / 255, 251 / 255, 254 / 255)
+
+
+# ==============set scene time info and force info ==============
+dt = 0.03 # 0.03
+
+gravity = ti.Vector([0, -9.8, 0])
+mass = 1.0
+
+spring_k = 4e6  # stiffness factor
+damping = 0.99 # spring loss
+
+
+ball_radius = 0.2
+ball_center = ti.Vector.field(3, dtype=float, shape=(1,))
+
+
+spring_offsets = []
+for i in range(-1, 2):
+    for j in range(-1, 2):
+        if (i, j) != (0, 0) and abs(i) + abs(j) <= 2:
+            spring_offsets.append(ti.Vector([i, j]))
+
+Pos_hat = ti.Vector.field(3, dtype=float, shape=(n, n))
+Gradient = ti.Vector.field(3, dtype=float, shape=(n, n))
+# just need fix this function to use different cloth simulation methods
+@ti.kernel
+def implicit_euler_init():
+    for i in ti.grouped(Pos):
+        if i[1] == 0 and (i[0] == 0 or i[0] == 127):
+            pass
+        else:
+            Vel[i] = damping * Vel[i]
+            Pos_hat[i] = Pos[i] + Vel[i] * dt
+            Pos[i] = Pos_hat[i]
+
+
+@ti.kernel
+def gradient_update():
+    for i in ti.grouped(Pos):
+        Gradient[i] = mass/(2 * dt * dt) * (Pos[i] - Pos_hat[i]) - gravity
+        for spring_offset in ti.static(spring_offsets):
+            j = i + spring_offset
+            if 0 <= j[0] < n and 0 <= j[1] < n:
+                x_ij = Pos[i] - Pos[j]
+                distance = x_ij.norm()
+                L = quad_size * float(i-j).norm()
+                Gradient[i] += spring_k * (1 - L/distance) * x_ij
+
+    ti.sync()
+    for i in ti.grouped(Pos):
+        if i[1] == 0 and (i[0] == 0 or i[0] == 127):
+            pass
+        else:
+            Pos[i] = Pos[i] - 1/ ( mass / (dt*dt) + 4 * spring_k) * Gradient[i]
+    for i in ti.grouped(Pos):
+        Gradient[i] = [0, 0, 0]
+
+@ti.kernel
+def update_vertices():
+    for i, j in ti.ndrange(n, n):
+        vertices[i * n + j] = Pos[i, j]
+        Vel[i, j] += 1/dt * (Pos[i,j] - Pos_hat[i, j])
+
+
+@ti.kernel
+def collision_handing_with_ball():
+    # how to react with moving ball ? no overshooting ,but explict euler will overshooting
+
+
+    for i in ti.grouped(Pos):
+        if (Pos[i] - ball_center[0]).norm() < ball_radius:
+            direction = (Pos[i] - ball_center[0]).normalized()
+            Vel[i] = Vel[i] + 1/dt * (ball_center[0] - Pos[i] + ball_radius * direction)
+            Pos[i] = ball_center[0] + ball_radius * direction
+
+
+
+def main():
+    window = ti.ui.Window("Taichi Cloth Simulation with explict euler ", (800, 600), vsync=True)
+    canvas = window.get_canvas()
+    canvas.set_background_color((0, 0, 0))
+    scene = ti.ui.Scene()
+    camera = ti.ui.Camera()
+    initial_spring_mesh()
+    num_iter = 32
+    current_time = 0.0
+
+    while window.running:
+        current_time += dt
+        ball_center[0] = [0.0, 0, 0.5 * ti.sin(current_time*0.6) - 0.5]
+
+        implicit_euler_init()
+        for i in range(num_iter):
+            gradient_update()
+        update_vertices()
+        collision_handing_with_ball()
+
+        # you can try this direction to view, what happen?
+        # camera.position(1.1, 0.0, 1.1)
+        # camera.lookat(-0.5, 0.0, -0.5)
+        camera.position(-0.8, 0.5, -1.2)
+        camera.lookat(0.5, 0.0, 0.5)
+
+        scene.set_camera(camera)
+        # light set
+        scene.point_light(pos=(0, 1, 2), color=(0.5, 0.5, 0.5))
+        scene.point_light(pos=(-1, -3, -4), color=(0.5, 0.5, 0.5))
+        # cloth mesh set
+        scene.mesh(vertices, indices=Triangles, per_vertex_color=colors, two_sided=True)
+        # scene particles
+        scene.particles(ball_center, radius=ball_radius*0.95, color=(122/255, 144/255, 188/255)) # smaller ball to escape inter-model
+
+        canvas.scene(scene)
+        window.show()
+
+
+if __name__ == "__main__":
+    main()
+
+
